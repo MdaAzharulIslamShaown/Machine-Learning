@@ -1,0 +1,563 @@
+from google.colab import drive
+drive.mount('/content/drive')
+import pandas as pd
+import random
+import numpy as np
+import os
+import cv2
+from  matplotlib import pyplot as plt
+import matplotlib.image as mpimg
+%matplotlib inline
+from __future__ import print_function
+from __future__ import division
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+from torchvision import datasets, models, transforms
+import time
+import copy
+data_dir = "./"
+model_name = "inception"
+#model_name = "densenet"
+num_classes = 3
+batch_size = 8
+num_epochs = 15
+feature_extract = True
+def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, is_inception=False):
+    since = time.time()
+
+    val_acc_history = []
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'validation']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # Iterate over data.
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                # zero the parameter gradients
+                optimizer.zero_grad()
+
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    # Get model outputs and calculate loss
+                    # Special case for inception because in training it has an auxiliary output. In train
+                    #   mode we calculate the loss by summing the final output and the auxiliary output
+                    #   but in testing we only consider the final output.
+                    if is_inception and phase == 'train':
+                        # From https://discuss.pytorch.org/t/how-to-optimize-inception-model-with-auxiliary-classifiers/7958
+                        outputs, aux_outputs = model(inputs)
+                        loss1 = criterion(outputs, labels)
+                        loss2 = criterion(aux_outputs, labels)
+                        loss = loss1 + 0.4*loss2
+                    else:
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+
+                    _, preds = torch.max(outputs, 1)
+
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+
+            # deep copy the model
+            if phase == 'validation' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = copy.deepcopy(model.state_dict())
+            if phase == 'validation':
+                val_acc_history.append(epoch_acc)
+
+        print()
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best val Acc: {:4f}'.format(best_acc))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+    return model, val_acc_history
+    def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for param in model.parameters():
+            param.requires_grad = False
+   def initialize_model(model_name, num_classes, feature_extract, use_pretrained=True):
+    # Initialize these variables which will be set in this if statement. Each of these
+    #   variables is model specific.
+    model_ft = None
+    input_size = 0
+
+    if model_name == "densenet":
+        """ Densenet
+        """
+        model_ft = models.densenet121(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier.in_features
+        model_ft.classifier = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "inception":
+        """ Inception v3
+        Be careful, expects (299,299) sized images and has auxiliary output
+        """
+        model_ft = models.inception_v3(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        # Handle the auxilary net
+        num_ftrs = model_ft.AuxLogits.fc.in_features
+        model_ft.AuxLogits.fc = nn.Linear(num_ftrs, num_classes)
+        # Handle the primary net
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs,num_classes)
+        input_size = 299
+
+    else:
+        print("Invalid model name, exiting...")
+        exit()
+
+    return model_ft, input_size
+
+# Initialize the model for this run
+model_ft, input_size = initialize_model(model_name, num_classes, feature_extract, use_pretrained=True)
+
+# Print the model we just instantiated
+print(model_ft)
+# Data augmentation and normalization for training
+# Just normalization for validation
+data_transforms = {
+    transforms.Compose([
+        transforms.RandomResizedCrop(input_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+print("Initializing Datasets and Dataloaders...")
+
+# Create training and validation datasets
+image_datasets = datasets.ImageFolder(data_dir, data_transforms)
+# Create training and validation dataloaders
+dataloaders_dict = torch.utils.data.DataLoader(image_datasets, batch_size=batch_size, shuffle=True, num_workers=2)
+
+# Detect if we have a GPU available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Data augmentation and normalization for training
+# Just normalization for validation
+data_transforms = {
+    'train': transforms.Compose([
+        # x = 224
+        # x = 299
+        transforms.Resize([int(299), int(299)]),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'validation': transforms.Compose([
+        # x = 224
+        #x = 299
+        transforms.Resize([int(299), int(299)]),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+print("Initializing Datasets and Dataloaders...")
+
+# Create training and validation datasets
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'validation']}
+# Create training and validation dataloaders
+dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=4) for x in ['train', 'validation']}
+
+# Detect if we have a GPU available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Send the model to GPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model_ft = model_ft.to(device)
+
+# Gather the parameters to be optimized/updated in this run. If we are
+#  finetuning we will be updating all parameters. However, if we are
+#  doing feature extract method, we will only update the parameters
+#  that we have just initialized, i.e. the parameters with requires_grad
+#  is True.
+params_to_update = model_ft.parameters()
+print("Params to learn:")
+if feature_extract:
+    params_to_update = []
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            params_to_update.append(param)
+            print("\t",name)
+else:
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            print("\t",name)
+
+# Observe that all parameters are being optimized
+optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
+# Setup the loss fxn
+criterion = nn.CrossEntropyLoss()
+
+# Train and evaluate
+model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs, is_inception=(model_name=="inception"))
+torch.save(model_ft.state_dict(), "dense_0.pth")
+IMG_WIDTH=299
+IMG_HEIGHT=299
+img_folder='test'
+plt.figure(figsize=(20,20))
+for i in range(10):
+    file = random.choice(os.listdir(img_folder))
+    im_path = os.listdir(os.path.join(img_folder, file))
+    x = random.choice(im_path)
+    image_path = os.path.join(img_folder, file,x)
+    img=mpimg.imread(image_path)
+    ax=plt.subplot(1,10,i+1)
+    ax.title.set_text(file)
+    plt.imshow(img)
+def create_dataset(img_folder):
+
+    img_data_array=[]
+    class_name=[]
+    im_dir_name = []
+
+    for dir1 in os.listdir(img_folder):
+        for file in os.listdir(os.path.join(img_folder, dir1)):
+
+            image_path= os.path.join(img_folder, dir1,  file)
+            #print(image_path)
+            im_dir_name.append(image_path)
+            image= cv2.imread( image_path, cv2.COLOR_BGR2RGB)
+            image=cv2.resize(image, (IMG_HEIGHT, IMG_WIDTH),interpolation = cv2.INTER_AREA)
+            image=np.array(image)
+            image = image.astype('float32')
+            image /= 255
+            img_data_array.append(image)
+            class_name.append(dir1)
+    return img_data_array, class_name, im_dir_name
+img_data, class_name, im_dir_name =create_dataset('./test')
+target_dict={k: v+1 for v, k in enumerate(np.unique(class_name))}
+target_dict
+target_val=  [target_dict[class_name[i]] for i in range(len(class_name))]
+#not required
+from sklearn.utils import shuffle
+img, trgt = shuffle(img_data, target_val)
+#inception v3
+model_ft.eval()
+#densenet
+model_ft.eval()
+def im_normalize(x):
+  MEAN = torch.tensor([0.485, 0.456, 0.406])
+  STD = torch.tensor([0.229, 0.224, 0.225])
+
+  x = torch.from_numpy(np.array(x))
+  x = x.type(torch.float32)
+  x = x.permute(-1, 0, 1)
+  x = (x - MEAN[:, None, None]) / STD[:, None, None]
+  return x
+from torch.autograd import Variable
+inception_res = []
+list_im = []
+list_dir = []
+for idx, img in enumerate(img_data):
+    img_dict = im_normalize(img)
+    list_dir.append(im_dir_name[idx])
+    img = img_dict[np.newaxis,:,:,:]
+    image_tensor = Variable(img).to(device, dtype=torch.float)
+    sr_image = model_ft(image_tensor).cpu()
+    probabilities = torch.nn.functional.softmax(sr_image[0], dim=0)
+    tmp = probabilities.detach().numpy()
+    print(tmp)
+    inception_res.append(list(tmp).index(max(tmp))+1)
+    list_im.append(img_dict.detach().numpy())
+plt.imshow(np.einsum('kli->lik', list_im[0]))
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import f1_score
+from sklearn.metrics import precision_score, recall_score
+#accuracy_score(y_true, y_pred)
+print("Inception V3 evaluation metrics:")
+print("Accuracy:", accuracy_score(target_val, inception_res))
+print("F1 Score:", f1_score(target_val, inception_res, average='macro'))
+print("Precision:", precision_score(target_val, inception_res, average='macro'))
+print("Recall:", recall_score(target_val, inception_res, average='macro'))
+#accuracy_score(y_true, y_pred)
+print("Densenet evaluation metrics:")
+print("Accuracy:", accuracy_score(target_val, inception_res))
+print("F1 Score:", f1_score(target_val, inception_res, average='macro'))
+print("Precision:", precision_score(target_val, inception_res, average='macro'))
+print("Recall:", recall_score(target_val, inception_res, average='macro'))
+new_inception_res = list(new_inception_res)
+def merge(list_im_arr, arr, l, m, r):
+  n1 = m - l + 1
+  n2 = r - m
+
+  L = [0] * (n1)
+  LIm = [0] * (n1)
+  R = [0] * (n2)
+  RIm = [0] * (n2)
+
+  for i in range(0, n1):
+    L[i] = arr[l + i]
+    LIm[i] = list_im_arr[l + i]
+
+  for j in range(0, n2):
+    R[j] = arr[m + 1 + j]
+    RIm[j] = list_im_arr[m + 1 + j]
+
+
+  i = 0
+  j = 0
+  k = l
+
+  while i < n1 and j < n2:
+    if L[i] <= R[j]:
+      arr[k] = L[i]
+      list_im_arr[k] = LIm[i]
+      i += 1
+    else:
+      arr[k] = R[j]
+      list_im_arr[k] = RIm[j]
+      j += 1
+    k += 1
+
+  while i < n1:
+    arr[k] = L[i]
+    list_im_arr[k] = LIm[i]
+    i += 1
+    k += 1
+
+
+  while j < n2:
+    arr[k] = R[j]
+    list_im_arr[k] = RIm[j]
+    j += 1
+    k += 1
+
+
+
+
+def mergeSort(list_im_arr, arr, l, r):
+	if l < r:
+		m = l+(r-l)//2
+		mergeSort(list_im_arr, arr, l, m)
+		mergeSort(list_im_arr, arr, m+1, r)
+		merge(list_im_arr, arr, l, m, r)
+
+
+arr = new_inception_res
+list_im_arr = list_dir
+n = len(arr)
+print("Given array is")
+for i in range(n):
+	print("%f" % arr[i],end=" ")
+print()
+for i in list_im_arr:
+  print(i)
+
+mergeSort(list_im_arr, arr, 0, n-1)
+print("\n\nSorted array is")
+for i in range(n):
+	print("%f" % arr[i],end=" ")
+print()
+for i in list_im_arr:
+  print(i)
+#densenet
+dist =[4, 7, 10, 6, 2, 8, 4, 7, 7, 4, 4, 3, 1, 4, 9, 3, 6, 2, 9, 8, 6, 6, 4, 4, 4, 9, 2, 9, 2, 6, 1, 6, 8, 6, 10, 8, 1, 10, 2, 9, 3, 6, 4, 9, 5, 10, 5, 8, 5]
+def mergeSort(im_arr, arr):
+    if len(arr) > 1:
+
+         # Finding the mid of the array
+        mid = len(arr)//2
+        mid = len(im_arr)//2
+        # Dividing the array elements
+        L = arr[:mid]
+        Lim = im_arr[:mid]
+        # into 2 halves
+        R = arr[mid:]
+        Rim = im_arr[mid:]
+        # Sorting the first half
+        mergeSort(L,Lim)
+
+        # Sorting the second half
+        mergeSort(R,Rim)
+
+        i = j = k = 0
+
+        # Copy data to temp arrays L[] and R[]
+        while i < len(L) and j < len(R):
+            if L[i] <= R[j]:
+                arr[k] = L[i]
+                im_arr[k] = Lim[i]
+                i += 1
+            else:
+                arr[k] = R[j]
+                im_arr[k] = Lim[i]
+                j += 1
+            k += 1
+
+        # Checking if any element was left
+        while i < len(L):
+            arr[k] = L[i]
+            i += 1
+            k += 1
+
+        while j < len(R):
+            arr[k] = R[j]
+            j += 1
+            k += 1
+        while i < len(Lim):
+            im_arr[k] = Lim[i]
+            i += 1
+            k += 1
+
+        while j < len(Rim):
+            im_arr[k] = Rim[j]
+            j += 1
+            k += 1
+
+
+# Code to print the list
+
+
+def printList(arr):
+    for i in range(len(arr)):
+        print(arr[i], end=" ")
+    print()
+def printList(im_arr):
+    for i in range(len(im_arr)):
+        print(im_arr[i], end=" ")
+    print()
+
+# Driver Code
+if __name__ == '__main__':
+    arr = [i / j for i, j in zip(inception_res, dist)]
+    im_arr = list_dir
+    print("Given array is", end="\n")
+    printList(arr)
+    printList(im_arr)
+    mergeSort(im_arr,arr)
+    print("Sorted array is: ", end="\n")
+    printList(arr)
+    printList(im_arr)
+ #Inception V3
+dist =[9,6,1,9,6,8,10,6,4,6,4,3,7,4,3,7,3,2,4,9,6,7,3,7,1,6,6,8,3,5,1,3,3,10,4,9,1,7,4,7,1,10,4,6,10,3,1,8,1,5,4,7,8,5,7,2,1,8,7,7,7,7,6,8,5,9,3,9,8,9,10,3,1,9,3,6,7,8,10,8,3,8,2,8,3,10,3,10,1,9,1,5,4,3,3,1,8,7,1,9,2,7,7,10,2,10,7,5,10,8,5,10,4,8,1,7,1,4,7,8,8,5,1,10,3,6,9,2,4,3,7,3,9,10,8,1,3,2,7,8,9,5,3,3,7,3,6,7,7,9,9,8,9,9,5,9,8,7,5,7,10]
+def merge(list_im_arr, arr, l, m, r):
+  n1 = m - l + 1
+  n2 = r - m
+
+  L = [0] * (n1)
+  LIm = [0] * (n1)
+  R = [0] * (n2)
+  RIm = [0] * (n2)
+
+  for i in range(0, n1):
+    L[i] = arr[l + i]
+    LIm[i] = list_im_arr[l + i]
+
+  for j in range(0, n2):
+    R[j] = arr[m + 1 + j]
+    RIm[j] = list_im_arr[m + 1 + j]
+
+
+  i = 0
+  j = 0
+  k = l
+
+  while i < n1 and j < n2:
+    if L[i] <= R[j]:
+      arr[k] = L[i]
+      list_im_arr[k] = LIm[i]
+      i += 1
+    else:
+      arr[k] = R[j]
+      list_im_arr[k] = RIm[j]
+      j += 1
+    k += 1
+
+  while i < n1:
+    arr[k] = L[i]
+    list_im_arr[k] = LIm[i]
+    i += 1
+    k += 1
+
+
+  while j < n2:
+    arr[k] = R[j]
+    list_im_arr[k] = RIm[j]
+    j += 1
+    k += 1
+
+
+
+
+def mergeSort(list_im_arr, arr, l, r):
+	if l < r:
+		m = l+(r-l)//2
+		mergeSort(list_im_arr, arr, l, m)
+		mergeSort(list_im_arr, arr, m+1, r)
+		merge(list_im_arr, arr, l, m, r)
+
+
+arr = [x/y for x, y in zip(map(float, inception_res), map(float, dist))]
+list_im_arr = list_dir
+n = len(arr)
+print(inception_res)
+print("Given array is")
+for i in range(n):
+	print("%f" % arr[i],end=" ")
+print()
+for i in list_im_arr:
+  print(i)
+
+mergeSort(list_im_arr, arr, 0, n-1)
+print("\n\nSorted array is")
+for i in range(n):
+	print("%f" % arr[i],end=" ")
+print()
+for i in list_im_arr:
+  print(i)
+ from sklearn.metrics import confusion_matrix
+import seaborn as sn
+import pandas as pd
+
+
+# constant for classes
+classes = ('Major_flooding', 'Moderate_flooding', 'Minor_flooding')
+
+# Build confusion matrix
+cf_matrix = confusion_matrix(target_val, inception_res)
+dataframe = pd.DataFrame(cf_matrix, index=classes, columns=classes)
+plt.figure(figsize=(10, 8))
+
+# Create heatmap
+sn.heatmap(dataframe, annot=True, cbar=None,cmap="YlGnBu",fmt="d")
+
+plt.title("Confusion Matrix"), plt.tight_layout()
+
+plt.ylabel("True Class"),
+plt.xlabel("Predicted Class")
+plt.show()
+plt.savefig('confusematrx.png')
